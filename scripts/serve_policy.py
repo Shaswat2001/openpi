@@ -97,12 +97,24 @@ def create_policy(args: Args) -> _policy.Policy:
 
 
 def main(args: Args) -> None:
+
+    import os
+    import random
+
+    seed = 9999
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+
+    import numpy as np
+    np.random.seed(seed)
+
+    import jax
+    import jax.numpy as jnp
+
+    key = jax.random.PRNGKey(seed)
+
     policy = create_policy(args)
     policy_metadata = policy.metadata
-
-    # Record the policy's behavior.
-    if args.record:
-        policy = _policy.PolicyRecorder(policy, "policy_records")
 
     hostname = socket.gethostname()
     local_ip = socket.gethostbyname(hostname)
