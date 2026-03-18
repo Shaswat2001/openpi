@@ -1,39 +1,46 @@
-"""OpenPI policy server with deterministic seeding.
+"""OpenPI policy server with deterministic seeding + true GPU-batched REST endpoint.
 
-This is your serve_policy.py with two changes:
-  1. Added --seed CLI argument
-  2. Wraps the policy in SeededPolicy before handing it to the WebSocket server
+Changes from the original:
+  1. --seed CLI argument + SeededPolicy wrapper (existing)
+  2. NEW: FastAPI REST server on port+1 with /act_batch endpoint
+     - Preprocesses N observations individually (transforms are per-sample)
+     - Stacks into one batch tensor (batch_dim = N)
+     - Runs ONE GPU forward pass (model.sample_actions)
+     - Splits results and postprocesses individually
+     - Returns N action chunks in one HTTP response
 
-The seed can be changed at runtime by the client — it sends "__seed__": N
-in the observation dict on the first infer() after each episode reset.
+Usage:
+  python serve_policy.py --env LIBERO --seed 42 --port 8000
+  # WebSocket on :8000 (unchanged)
+  # REST /act_batch on :8001 (new)
 """
 
 import dataclasses
 import enum
 import logging
 import socket
+import threading
+import time
 
 import tyro
 
-import logging
 import random
-from typing import Any
+from typing import Any, Dict, List
 
 import numpy as np
-
 
 from openpi.policies import policy as _policy
 from openpi.policies import policy_config as _policy_config
 from openpi.serving import websocket_policy_server
 from openpi.training import config as _config
+from openpi.models import model as _model
 
-# Import our seeded wrapper.
-# Option A: if you placed seeded_policy.py in src/openpi/policies/:
-#   from openpi.policies.seeded_policy import SeededPolicy, seed_global_rngs
-# Option B: if you placed it next to this script:
+
+# ─────────────────────────────────────────────────────────────────────
+# Seeding utilities
+# ─────────────────────────────────────────────────────────────────────
 
 def seed_global_rngs(seed: int) -> None:
-    """Seed Python, NumPy, and (optionally) PyTorch global RNGs."""
     random.seed(seed)
     np.random.seed(seed)
     try:
@@ -48,26 +55,11 @@ def seed_global_rngs(seed: int) -> None:
 
 
 class SeededPolicy:
-    """Deterministic wrapper around an openpi Policy.
-
-    Usage on server side (in serve_policy.py):
-        raw_policy = create_policy(args)
-        policy = SeededPolicy(raw_policy, seed=42)
-        # Then pass `policy` to the WebSocket server as usual.
-
-    The client triggers a reseed by including "__seed__": <int> in the
-    observation dict passed to infer().  This field is detected, consumed,
-    and the RNG is reset before the model runs.
-    """
+    """Deterministic wrapper around an openpi Policy with batch support."""
 
     def __init__(self, policy, seed: int = 0):
         self._policy = policy
-
-        # Detect if this is a PyTorch model
-        self._is_pytorch = getattr(policy, '_is_pytorch', False)
-
-        # Auto-detect the JAX PRNG attribute name on the policy object.
-        # Common names across openpi versions: _rng, rng, _rng_key
+        self._is_pytorch = getattr(policy, '_is_pytorch_model', False)
         self._rng_attr = None
         if not self._is_pytorch:
             for attr in ('_rng', 'rng', '_rng_key', 'rng_key'):
@@ -75,41 +67,20 @@ class SeededPolicy:
                     self._rng_attr = attr
                     logging.info("SeededPolicy: found JAX PRNG attr '%s'", attr)
                     break
-            if self._rng_attr is None:
-                logging.warning(
-                    "SeededPolicy: could not find JAX PRNG attr on Policy. "
-                    "Run on your machine:\n"
-                    "  grep -n 'rng' src/openpi/policies/policy.py\n"
-                    "to find the correct attribute name."
-                )
-
         self.reset(seed)
 
     def reset(self, seed: int | None = None) -> None:
-        """Reset the RNG state. Called at the start of each episode."""
         if seed is not None:
             self._seed = seed
         self._call_count = 0
         seed_global_rngs(self._seed)
-
         if not self._is_pytorch:
             import jax
             self._base_key = jax.random.key(self._seed)
-
         logging.info("SeededPolicy.reset(seed=%d)", self._seed)
 
-    def infer(self, obs: dict[str, Any]) -> dict[str, Any]:
-        """Run one inference step with deterministic RNG.
-
-        If obs contains "__seed__", reseed first, then remove it.
-        """
-        # ---- Check for client-injected seed ----
-        if "__seed__" in obs:
-            new_seed = int(obs.pop("__seed__"))
-            logging.info("SeededPolicy: received seed=%d from client", new_seed)
-            self.reset(seed=new_seed)
-
-        # ---- Set deterministic RNG for this step ----
+    def _set_rng_for_step(self):
+        """Set deterministic RNG state for the current call_count."""
         if self._is_pytorch:
             import torch
             step_seed = self._seed + self._call_count
@@ -121,21 +92,159 @@ class SeededPolicy:
                 import jax
                 key = jax.random.fold_in(self._base_key, self._call_count)
                 setattr(self._policy, self._rng_attr, key)
-
         self._call_count += 1
+
+    def infer(self, obs: dict[str, Any]) -> dict[str, Any]:
+        """Single observation inference (used by WebSocket server)."""
+        if "__seed__" in obs:
+            self.reset(seed=int(obs.pop("__seed__")))
+        self._set_rng_for_step()
         return self._policy.infer(obs)
+
+    def infer_batch(self, obs_list: List[dict[str, Any]]) -> List[dict[str, Any]]:
+        """
+        True GPU-batched inference:
+          1. Input transforms per sample (these are CPU-side normalization/resize)
+          2. Stack N samples into one batch tensor
+          3. ONE model.sample_actions() call with batch_dim=N
+          4. Split batch, output transforms per sample
+
+        This mirrors Policy.infer() exactly but replaces [None, ...] (batch=1)
+        with a proper N-way stack.
+        """
+        # Handle per-obs seeding
+        for obs in obs_list:
+            if "__seed__" in obs:
+                self.reset(seed=int(obs.pop("__seed__")))
+        self._set_rng_for_step()
+
+        policy = self._policy
+        N = len(obs_list)
+
+        # ── Step 1: per-sample input transforms ─────────────────────
+        import jax as _jax
+        transformed = []
+        for obs in obs_list:
+            inputs = _jax.tree.map(lambda x: x, obs)  # shallow copy
+            inputs = policy._input_transform(inputs)
+            transformed.append(inputs)
+
+        # ── Step 2: stack into batch of N ───────────────────────────
+        # Use tree.map to handle nested dicts (e.g. "images": {"cam": array})
+        if policy._is_pytorch_model:
+            import torch
+            import jax as _jax
+
+            def _stack_torch(*samples):
+                tensors = [torch.from_numpy(np.array(s)).to(policy._pytorch_device)
+                           for s in samples]
+                return torch.stack(tensors, dim=0)
+
+            batched = _jax.tree.map(_stack_torch, *transformed)
+            sample_rng_or_device = policy._pytorch_device
+        else:
+            import jax
+            import jax.numpy as jnp
+
+            def _stack_jax(*samples):
+                return jnp.stack([jnp.asarray(s) for s in samples], axis=0)
+
+            batched = jax.tree.map(_stack_jax, *transformed)
+            policy._rng, sample_rng_or_device = jax.random.split(policy._rng)
+
+        # ── Step 3: ONE GPU forward pass ────────────────────────────
+        observation = _model.Observation.from_dict(batched)
+        sample_kwargs = dict(policy._sample_kwargs)
+
+        # Log shapes to verify batching is correct
+        for k, v in batched.items():
+            if hasattr(v, 'shape'):
+                logging.info("  batched[%s].shape = %s", k, v.shape)
+
+        start_time = time.monotonic()
+        actions = policy._sample_actions(
+            sample_rng_or_device, observation, **sample_kwargs,
+        )
+        # actions shape: [N, action_horizon, action_dim]
+        model_time = time.monotonic() - start_time
+
+        if hasattr(actions, 'shape'):
+            logging.info("  actions.shape = %s", actions.shape)
+
+        # ── Step 4: split batch → per-sample numpy ──────────────────
+        import jax as _jax
+
+        results = []
+        for i in range(N):
+            if policy._is_pytorch_model:
+                out_state = _jax.tree.map(
+                    lambda x: np.asarray(x[i].detach().cpu()), batched["state"]
+                )
+                out_actions = np.asarray(actions[i].detach().cpu())
+            else:
+                out_state = _jax.tree.map(
+                    lambda x: np.asarray(x[i]), batched["state"]
+                )
+                out_actions = np.asarray(actions[i])
+
+            out = {"state": out_state, "actions": out_actions}
+
+            # ── Step 5: per-sample output transforms ────────────────
+            out = policy._output_transform(out)
+            out["policy_timing"] = {"infer_ms": model_time * 1000 / N}
+            results.append(out)
+
+        logging.info(
+            "infer_batch: N=%d, model_time=%.0fms (%.0fms/sample)",
+            N, model_time * 1000, model_time * 1000 / N,
+        )
+        return results
 
     @property
     def metadata(self) -> dict[str, Any]:
         return self._policy.metadata
 
     def __getattr__(self, name):
-        """Forward everything else to the wrapped policy."""
         return getattr(self._policy, name)
 
 
+# ─────────────────────────────────────────────────────────────────────
+# REST batch endpoint
+# ─────────────────────────────────────────────────────────────────────
+
+def start_rest_server(policy: SeededPolicy, port: int) -> None:
+    """FastAPI server with /act_batch doing true GPU-batched inference."""
+    import json_numpy
+    json_numpy.patch()
+
+    from fastapi import FastAPI
+    from starlette.responses import Response
+    import uvicorn
+
+    app = FastAPI()
+
+    @app.post("/act_batch")
+    def act_batch(payload: Dict[str, Any]) -> Response:
+        observations: List[Dict] = payload["observations"]
+        results = policy.infer_batch(observations)
+        return Response(
+            content=json_numpy.dumps(results),
+            media_type="application/json",
+        )
+
+    @app.get("/health")
+    def health():
+        return {"status": "ok"}
+
+    logging.info("Starting REST server on port %d (GPU-batched endpoint)", port)
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="warning")
+
+
+# ─────────────────────────────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────────────────────────────
+
 class EnvMode(enum.Enum):
-    """Supported environments."""
     ALOHA = "aloha"
     ALOHA_SIM = "aloha_sim"
     DROID = "droid"
@@ -144,29 +253,26 @@ class EnvMode(enum.Enum):
 
 @dataclasses.dataclass
 class Checkpoint:
-    """Load a policy from a trained checkpoint."""
     config: str
     dir: str
 
 
 @dataclasses.dataclass
 class Default:
-    """Use the default policy for the given environment."""
+    pass
 
 
 @dataclasses.dataclass
 class Args:
-    """Arguments for the serve_policy script."""
     env: EnvMode = EnvMode.ALOHA_SIM
     default_prompt: str | None = None
     port: int = 8000
     record: bool = False
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
-    # ---- NEW: initial seed for deterministic inference ----
     seed: int = 0
+    rest_port: int | None = None
 
 
-# Default checkpoints for each environment.
 DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
     EnvMode.ALOHA: Checkpoint(
         config="pi05_aloha",
@@ -187,8 +293,7 @@ DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
 }
 
 
-def create_default_policy(env: EnvMode, *, default_prompt: str | None = None) -> _policy.Policy:
-    """Create a default policy for the given environment."""
+def create_default_policy(env, *, default_prompt=None):
     if checkpoint := DEFAULT_CHECKPOINT.get(env):
         return _policy_config.create_trained_policy(
             _config.get_config(checkpoint.config),
@@ -198,8 +303,7 @@ def create_default_policy(env: EnvMode, *, default_prompt: str | None = None) ->
     raise ValueError(f"Unsupported environment mode: {env}")
 
 
-def create_policy(args: Args) -> _policy.Policy:
-    """Create a policy from the given arguments."""
+def create_policy(args):
     match args.policy:
         case Checkpoint():
             return _policy_config.create_trained_policy(
@@ -208,32 +312,37 @@ def create_policy(args: Args) -> _policy.Policy:
                 default_prompt=args.default_prompt,
             )
         case Default():
-            return create_default_policy(args.env, default_prompt=args.default_prompt)
+            return create_default_policy(
+                args.env, default_prompt=args.default_prompt,
+            )
 
 
 def main(args: Args) -> None:
-    # 1. Seed global RNGs before model loading
     seed_global_rngs(args.seed)
-
-    # 2. Create the raw policy (unchanged)
     raw_policy = create_policy(args)
     policy_metadata = raw_policy.metadata
-
-    # 3. ---- NEW: wrap in SeededPolicy ----
     policy = SeededPolicy(raw_policy, seed=args.seed)
 
-    # 4. Optional recording
     if args.record:
         policy = _policy.PolicyRecorder(policy, "policy_records")
 
     hostname = socket.gethostname()
     local_ip = socket.gethostbyname(hostname)
+    rest_port = args.rest_port or (args.port + 1)
+
     logging.info(
-        "Creating server (host: %s, ip: %s, seed: %d)",
-        hostname, local_ip, args.seed,
+        "Server: host=%s, ip=%s, seed=%d, ws_port=%d, rest_port=%d",
+        hostname, local_ip, args.seed, args.port, rest_port,
     )
 
-    # 5. Start the WebSocket server (unchanged)
+    rest_thread = threading.Thread(
+        target=start_rest_server,
+        args=(policy, rest_port),
+        daemon=True,
+    )
+    rest_thread.start()
+    logging.info("REST batch endpoint at http://%s:%d/act_batch", local_ip, rest_port)
+
     server = websocket_policy_server.WebsocketPolicyServer(
         policy=policy,
         host="0.0.0.0",
